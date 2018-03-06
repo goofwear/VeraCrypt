@@ -530,7 +530,45 @@ namespace VeraCrypt
 			return bytesRead;
 		}
 
-		throw_sys_if (!ReadFile (Handle, buffer, size, &bytesRead, NULL));
+		if (!ReadFile (Handle, buffer, size, &bytesRead, NULL))
+		{
+			DWORD dwLastError = GetLastError();
+			if ((dwLastError == ERROR_INVALID_PARAMETER) && IsDevice && (size % 4096))
+			{					
+				DWORD remainingSize = (size % 4096);
+				DWORD alignedSize = size - remainingSize;
+				LARGE_INTEGER offset;
+
+				if (alignedSize)
+				{
+					if (ReadFile (Handle, buffer, alignedSize, &bytesRead, NULL))
+					{
+						if (bytesRead < alignedSize)
+							return bytesRead;
+
+						buffer += alignedSize;
+						size -= alignedSize;
+					}
+					else
+						throw SystemException (SRC_POS);
+				}
+
+
+				if (ReadFile (Handle, ReadBuffer, 4096, &bytesRead, NULL))
+				{
+					DWORD effectiveSize = min (bytesRead, remainingSize);					
+					memcpy (buffer, ReadBuffer, effectiveSize);
+					offset.QuadPart = - ((LONGLONG) bytesRead) + (LONGLONG) effectiveSize;
+					SetFilePointerEx (Handle, offset, NULL, FILE_CURRENT);
+					return alignedSize + effectiveSize;
+				}
+				else
+					throw SystemException (SRC_POS);
+			}
+			else
+				throw SystemException (SRC_POS);
+		}
+
 		return bytesRead;
 	}
 
@@ -600,7 +638,63 @@ namespace VeraCrypt
 			}
 			else
 			{
-				throw_sys_if (!WriteFile (Handle, buffer, size, &bytesWritten, NULL) || bytesWritten != size);
+				if (!WriteFile (Handle, buffer, size, &bytesWritten, NULL))
+				{
+					DWORD dwLastError = GetLastError ();
+					if ((ERROR_INVALID_PARAMETER == dwLastError) && IsDevice && !ReadOnly && (size % 4096))
+					{
+						bool bSuccess = false;						
+						DWORD remainingSize = (size % 4096);
+						DWORD alignedSize = size - remainingSize;
+						DWORD bytesRead = 0;
+						bytesWritten = 0;
+						if (alignedSize)
+						{
+							if (WriteFile (Handle, buffer, alignedSize, &bytesWritten, NULL))
+							{
+								throw_sys_if (bytesWritten != alignedSize);
+								buffer += alignedSize;
+								size -= alignedSize;
+							}
+							else
+							{
+								bytesWritten = 0;
+								dwLastError = GetLastError ();
+							}
+						}
+
+						if (!alignedSize || (alignedSize && bytesWritten))
+						{
+							LARGE_INTEGER offset;
+
+							throw_sys_if (!ReadFile (Handle, ReadBuffer, 4096, &bytesRead, NULL) || (bytesRead != 4096));
+							offset.QuadPart = -4096;
+							throw_sys_if (!SetFilePointerEx (Handle, offset, NULL, FILE_CURRENT));
+
+							memcpy (ReadBuffer, buffer, remainingSize);
+
+							if (WriteFile (Handle, ReadBuffer, 4096, &bytesWritten, NULL))
+							{
+								throw_sys_if (bytesWritten != 4096);
+								bSuccess = true;
+							}
+							else
+							{
+								dwLastError = GetLastError ();
+							}
+						}
+
+						if (!bSuccess)
+						{
+							SetLastError (dwLastError);
+							throw SystemException (SRC_POS);
+						}
+					}
+					else
+						throw SystemException (SRC_POS);
+				}
+				else
+					throw_sys_if (bytesWritten != size);				
 			}
 		}
 		catch (SystemException &e)
@@ -2128,13 +2222,16 @@ namespace VeraCrypt
 		GetVolumeESP(pathESP);
 		if (szFilePath[0] != L'\\')
 			pathESP += L"\\";
-		File f(pathESP + szFilePath, false, true);
+
 		fileContent.resize(dwSize);
 		if (bAddUTF8BOM)
 			memcpy (fileContent.data(), "\xEF\xBB\xBF", 3);
 		memcpy (&fileContent[dwOffset], pbData, dwDataLen);
+
+		File f(pathESP + szFilePath, false, true);
 		f.Write(fileContent.data(), dwSize);
 		f.Close();
+
 	}
 
 	EfiBoot::EfiBoot() {
@@ -2422,9 +2519,11 @@ namespace VeraCrypt
 	void EfiBoot::SaveFile(const wchar_t* name, byte* data, DWORD size) {
 		wstring path = EfiBootPartPath;
 		path += name;
+
 		File f(path, false, true);
 		f.Write(data, size);
 		f.Close();
+
 	}
 
 	void EfiBoot::GetFileSize(const wchar_t* name, unsigned __int64& size) {

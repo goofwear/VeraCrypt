@@ -327,10 +327,14 @@ static void ComputeBootLoaderFingerprint(PDEVICE_OBJECT LowerDeviceObject, byte*
 	status = TCReadDevice (LowerDeviceObject, ioBuffer, offset, TC_SECTOR_SIZE_BIOS);
 	if (NT_SUCCESS (status))
 	{
-#if !defined (_WIN64)
-		KFLOATING_SAVE floatingPointState;
-		NTSTATUS saveStatus = STATUS_SUCCESS;
-		if (HasISSE()|| (HasSSE2() && HasMMX()))
+		NTSTATUS saveStatus = STATUS_INVALID_PARAMETER;
+#ifdef _WIN64
+		XSTATE_SAVE SaveState;
+		if (g_isIntel && HasSAVX())
+			saveStatus = KeSaveExtendedProcessorState(XSTATE_MASK_GSSE, &SaveState);
+#else
+		KFLOATING_SAVE floatingPointState;		
+		if (HasISSE() || (HasSSSE3() && HasMMX()))
 			saveStatus = KeSaveFloatingPointState (&floatingPointState);
 #endif
 		WHIRLPOOL_add (ioBuffer, TC_BOOT_SECTOR_PIM_VALUE_OFFSET, &whirlpool);
@@ -367,8 +371,10 @@ static void ComputeBootLoaderFingerprint(PDEVICE_OBJECT LowerDeviceObject, byte*
 			sha512_end (&BootLoaderFingerprint [WHIRLPOOL_DIGESTSIZE], &sha2);
 		}
 
-#if !defined (_WIN64)
-		if (NT_SUCCESS (saveStatus) && (HasISSE() || (HasSSE2() && HasMMX())))
+		if (NT_SUCCESS (saveStatus))
+#ifdef _WIN64
+			KeRestoreExtendedProcessorState(&SaveState);
+#else
 			KeRestoreFloatingPointState (&floatingPointState);
 #endif
 	}
@@ -935,6 +941,46 @@ static NTSTATUS DispatchPower (PDEVICE_OBJECT DeviceObject, PIRP Irp, DriveFilte
 	return status;
 }
 
+static NTSTATUS DispatchControl (PDEVICE_OBJECT DeviceObject, PIRP Irp, DriveFilterExtension *Extension, PIO_STACK_LOCATION irpSp)
+{
+	BOOL bBlockTrim = BlockSystemTrimCommand || IsHiddenSystemRunning();
+	NTSTATUS status = IoAcquireRemoveLock (&Extension->Queue.RemoveLock, Irp);
+	if (!NT_SUCCESS (status))
+		return TCCompleteIrp (Irp, status, 0);
+
+	switch (irpSp->Parameters.DeviceIoControl.IoControlCode)
+	{
+		case IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES:
+			Dump ("DriverFilter-DispatchControl: IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES\n");
+			if (bBlockTrim)
+			{
+				PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation (Irp);
+				DWORD inputLength = irpSp->Parameters.DeviceIoControl.InputBufferLength;
+				if (inputLength >= sizeof (DEVICE_MANAGE_DATA_SET_ATTRIBUTES))
+				{
+					PDEVICE_MANAGE_DATA_SET_ATTRIBUTES pInputAttrs = (PDEVICE_MANAGE_DATA_SET_ATTRIBUTES) Irp->AssociatedIrp.SystemBuffer;
+					DEVICE_DATA_MANAGEMENT_SET_ACTION action = pInputAttrs->Action;
+					if (action == DeviceDsmAction_Trim)
+					{
+						Dump ("DriverFilter-DispatchControl: IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES - DeviceDsmAction_Trim.\n");
+
+						if (bBlockTrim)
+						{
+							Dump ("DriverFilter-DispatchControl:: TRIM command blocked.\n");
+							IoReleaseRemoveLock (&Extension->Queue.RemoveLock, Irp);
+							return TCCompleteDiskIrp (Irp, STATUS_SUCCESS, 0);
+						}
+					}
+				}
+			}
+			break;
+	}
+
+	status = PassIrp (Extension->LowerDeviceObject, Irp);
+	IoReleaseRemoveLock (&Extension->Queue.RemoveLock, Irp);
+	return status;
+}
+
 
 NTSTATUS DriveFilterDispatchIrp (PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
@@ -964,6 +1010,9 @@ NTSTATUS DriveFilterDispatchIrp (PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
 	case IRP_MJ_POWER:
 		return DispatchPower (DeviceObject, Irp, Extension, irpSp);
+
+	case IRP_MJ_DEVICE_CONTROL:
+		return DispatchControl (DeviceObject, Irp, Extension, irpSp);
 	}
 
 	status = IoAcquireRemoveLock (&Extension->Queue.RemoveLock, Irp);

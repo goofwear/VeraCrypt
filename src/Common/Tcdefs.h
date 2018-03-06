@@ -55,15 +55,15 @@ extern unsigned short _rotl16(unsigned short value, unsigned char shift);
 #define TC_APP_NAME						"VeraCrypt"
 
 // Version displayed to user 
-#define VERSION_STRING					"1.21"
+#define VERSION_STRING					"1.22-BETA4"
 
 // Version number to compare against driver
-#define VERSION_NUM						0x0121
+#define VERSION_NUM						0x0122
 
 // Release date
-#define TC_STR_RELEASE_DATE			L"July 1, 2017"
+#define TC_STR_RELEASE_DATE			L"December 8, 2017"
 #define TC_RELEASE_DATE_YEAR			2017
-#define TC_RELEASE_DATE_MONTH			 07
+#define TC_RELEASE_DATE_MONTH			 12
 
 #define BYTES_PER_KB                    1024LL
 #define BYTES_PER_MB                    1048576LL
@@ -259,6 +259,26 @@ typedef int BOOL;
 #ifndef FALSE
 #define FALSE !TRUE
 #endif
+
+typedef NTSTATUS (NTAPI *KeSaveExtendedProcessorStateFn) (
+    __in ULONG64 Mask,
+    PXSTATE_SAVE XStateSave
+    );
+
+
+typedef VOID (NTAPI *KeRestoreExtendedProcessorStateFn) (
+	PXSTATE_SAVE XStateSave
+	);
+
+extern NTSTATUS NTAPI KeSaveExtendedProcessorState (
+    __in ULONG64 Mask,
+    PXSTATE_SAVE XStateSave
+    );
+
+
+extern VOID NTAPI KeRestoreExtendedProcessorState (
+	PXSTATE_SAVE XStateSave
+	);
 
 #else				/* !TC_WINDOWS_DRIVER */
 #if !defined(_UEFI)

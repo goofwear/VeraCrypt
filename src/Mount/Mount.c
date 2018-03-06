@@ -51,7 +51,7 @@
 
 #include <Strsafe.h>
 
-#import <msxml6.dll>
+#import <msxml6.dll> no_auto_exclude
 
 #include <wtsapi32.h>
 
@@ -493,6 +493,9 @@ static void InitMainDialog (HWND hwndDlg)
 	{
 		e.Show (NULL);
 	}
+
+	// initialize the list of devices available for mounting as early as possible
+	UpdateMountableHostDeviceList ();
 
 	// Resize the logo bitmap if the user has a non-default DPI
 	if (ScreenDPI != USER_DEFAULT_SCREEN_DPI
@@ -2434,7 +2437,7 @@ BOOL CALLBACK PasswordChangeDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam, LPAR
 
 			if (lw == IDC_PIM)
 			{
-				if(GetPim (hwndDlg, IDC_OLD_PIM) != GetPim (hwndDlg, IDC_PIM))
+				if(GetPim (hwndDlg, IDC_OLD_PIM, 0) != GetPim (hwndDlg, IDC_PIM, 0))
 				{
 					PimValueChangedWarning = TRUE;
 					SetDlgItemTextW (hwndDlg, IDC_PIM_HELP, GetString (bSysEncPwdChangeDlgMode? "PIM_SYSENC_CHANGE_WARNING" : "PIM_CHANGE_WARNING"));
@@ -2631,8 +2634,8 @@ BOOL CALLBACK PasswordChangeDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam, LPAR
 					SendMessage (GetDlgItem (hwndDlg, IDC_PKCS5_PRF_ID), CB_GETCURSEL, 0, 0), 0);
 			BOOL truecryptMode = GetCheckBox (hwndDlg, IDC_TRUECRYPT_MODE);
 
-			int old_pim = GetPim (hwndDlg, IDC_OLD_PIM);
-			int pim = GetPim (hwndDlg, IDC_PIM);
+			int old_pim = GetPim (hwndDlg, IDC_OLD_PIM, 0);
+			int pim = GetPim (hwndDlg, IDC_PIM, 0);
 
 			if (truecryptMode && !is_pkcs5_prf_supported (old_pkcs5, TRUE, PRF_BOOT_NO))
 			{
@@ -2672,7 +2675,19 @@ BOOL CALLBACK PasswordChangeDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam, LPAR
 			else if (!(newKeyFilesParam.EnableKeyFiles && newKeyFilesParam.FirstKeyFile != NULL)
 				&& pwdChangeDlgMode == PCDM_CHANGE_PASSWORD)
 			{
-				if (!CheckPasswordLength (hwndDlg, GetWindowTextLength(GetDlgItem (hwndDlg, IDC_PASSWORD)), pim, bSysEncPwdChangeDlgMode, FALSE, FALSE))
+				int bootPRF = 0;
+				if (bSysEncPwdChangeDlgMode)
+				{
+					try
+					{
+						VOLUME_PROPERTIES_STRUCT properties;
+						BootEncObj->GetVolumeProperties(&properties);
+						bootPRF = properties.pkcs5;
+					}
+					catch(...)
+					{}
+				}
+				if (!CheckPasswordLength (hwndDlg, GetWindowTextLength(GetDlgItem (hwndDlg, IDC_PASSWORD)), pim, bSysEncPwdChangeDlgMode, bootPRF, FALSE, FALSE))
 					return 1;
 			}
 
@@ -3099,7 +3114,7 @@ BOOL CALLBACK PasswordDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lPa
 				*pkcs5 = (int) SendMessage (GetDlgItem (hwndDlg, IDC_PKCS5_PRF_ID), CB_GETITEMDATA, SendMessage (GetDlgItem (hwndDlg, IDC_PKCS5_PRF_ID), CB_GETCURSEL, 0, 0), 0);
 				*truecryptMode = GetCheckBox (hwndDlg, IDC_TRUECRYPT_MODE);
 
-				*pim = GetPim (hwndDlg, IDC_PIM);
+				*pim = GetPim (hwndDlg, IDC_PIM, 0);
 
 				/* check that PRF is supported in TrueCrypt Mode */
 				if (	(*truecryptMode)
@@ -3651,7 +3666,7 @@ BOOL CALLBACK MountOptionsDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM
 				mountOptions->ProtectedHidVolPkcs5Prf = (int) SendMessage (GetDlgItem (hwndDlg, IDC_PKCS5_PRF_ID), CB_GETITEMDATA,
 					SendMessage (GetDlgItem (hwndDlg, IDC_PKCS5_PRF_ID), CB_GETCURSEL, 0, 0), 0);
 
-				mountOptions->ProtectedHidVolPim = GetPim (hwndDlg, IDC_PIM);
+				mountOptions->ProtectedHidVolPim = GetPim (hwndDlg, IDC_PIM, 0);
 			}
 
 			// Cleanup
@@ -4816,8 +4831,8 @@ static BOOL Mount (HWND hwndDlg, int nDosDriveNo, wchar_t *szFileName, int pim, 
 		// try TrueCrypt mode first as it is quick, only if no custom pim specified
 		if (EffectiveVolumeTrueCryptMode)
 			mounted = MountVolume (hwndDlg, nDosDriveNo, szFileName, &VolumePassword, EffectiveVolumePkcs5, 0, TRUE, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE);
-		else
-			mounted = MountVolume (hwndDlg, nDosDriveNo, szFileName, &VolumePassword, EffectiveVolumePkcs5, EffectiveVolumePim, FALSE, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE);
+		else // if no PIM specified for favorite, we use also the PIM of the previous volume alongside its password.
+			mounted = MountVolume (hwndDlg, nDosDriveNo, szFileName, &VolumePassword, EffectiveVolumePkcs5, (EffectiveVolumePim < 0)? VolumePim : EffectiveVolumePim, FALSE, bCacheInDriver, bIncludePimInCache, bForceMount, &mountOptions, Silent, FALSE);
 	}
 
 	NormalCursor ();
@@ -7180,7 +7195,7 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 								if (IsMountedVolumeID (favorite.VolumeID))
 									continue;
 
-								std::wstring volDevPath = FindDeviceByVolumeID (favorite.VolumeID);
+								std::wstring volDevPath = FindDeviceByVolumeID (favorite.VolumeID, FALSE);
 								if (volDevPath.length() > 0)
 								{
 									favorite.Path = volDevPath;
@@ -8471,7 +8486,7 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 					std::wstring volName;
 					WaitCursor();
 					if (FavoriteVolumes[favoriteIndex].UseVolumeID)
-						volName = FindDeviceByVolumeID (FavoriteVolumes[favoriteIndex].VolumeID);
+						volName = FindDeviceByVolumeID (FavoriteVolumes[favoriteIndex].VolumeID, FALSE);
 					else
 						volName = FavoriteVolumes[favoriteIndex].Path;
 					OpenVolumeExplorerWindow (GetMountedVolumeDriveNo ((wchar_t*) FavoriteVolumes[favoriteIndex].Path.c_str()));
@@ -8514,6 +8529,10 @@ BOOL CALLBACK MainDialogProc (HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lPa
 		MainWindowHidden = FALSE;
 		ShowWindow (hwndDlg, SW_SHOW);
 		ShowWindow (hwndDlg, SW_RESTORE);
+		return 1;
+
+	case VC_APPMSG_CREATE_RESCUE_DISK:
+		CreateRescueDisk (hwndDlg);
 		return 1;
 
 	case WM_COPYDATA:
@@ -9118,6 +9137,21 @@ static VOID WINAPI SystemFavoritesServiceCtrlHandler (DWORD control)
 		SystemFavoritesServiceSetStatus (SystemFavoritesServiceStatus.dwCurrentState);
 }
 
+static LONG WINAPI SystemFavoritesServiceExceptionHandler (EXCEPTION_POINTERS *ep)
+{
+	SetUnhandledExceptionFilter (NULL);
+
+	if (!(ReadDriverConfigurationFlags() & TC_DRIVER_CONFIG_CACHE_BOOT_PASSWORD))
+		WipeCache (NULL, TRUE);
+
+	UnhandledExceptionFilter (ep);
+	return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void SystemFavoritesServiceInvalidParameterHandler (const wchar_t *expression, const wchar_t *function, const wchar_t *file, unsigned int line, uintptr_t reserved)
+{
+	TC_THROW_FATAL_EXCEPTION;
+}
 
 static VOID WINAPI SystemFavoritesServiceMain (DWORD argc, LPTSTR *argv)
 {
@@ -9129,7 +9163,16 @@ static VOID WINAPI SystemFavoritesServiceMain (DWORD argc, LPTSTR *argv)
 	if (!SystemFavoritesServiceStatusHandle)
 		return;
 
+	InitGlobalLocks ();
+
+	SetUnhandledExceptionFilter (SystemFavoritesServiceExceptionHandler);
+	_set_invalid_parameter_handler (SystemFavoritesServiceInvalidParameterHandler);
+
 	SystemFavoritesServiceSetStatus (SERVICE_START_PENDING, 120000);
+
+	SystemFavoritesServiceLogInfo (wstring (L"Initializing list of host devices"));
+	// initialize the list of devices available for mounting as early as possible
+	UpdateMountableHostDeviceList ();
 
 	SystemFavoritesServiceLogInfo (wstring (L"Starting System Favorites mounting process"));
 
@@ -9147,6 +9190,8 @@ static VOID WINAPI SystemFavoritesServiceMain (DWORD argc, LPTSTR *argv)
 	{
 		SystemFavoritesServiceLogError (wstring (L"System Favorites mounting process failed."));
 	}
+
+	FinalizeGlobalLocks ();
 
 	SystemFavoritesServiceSetStatus (SERVICE_RUNNING);
 	SystemFavoritesServiceSetStatus (SERVICE_STOPPED);
@@ -9199,7 +9244,7 @@ int WINAPI wWinMain (HINSTANCE hInstance, HINSTANCE hPrevInstance, wchar_t *lpsz
 	VirtualLock (&CmdVolumePassword, sizeof (CmdVolumePassword));
 	VirtualLock (&mountOptions, sizeof (mountOptions));
 	VirtualLock (&defaultMountOptions, sizeof (defaultMountOptions));
-	VirtualLock (&szFileName, sizeof(szFileName));
+	VirtualLock (&szFileName, sizeof(szFileName));	
 
 	DetectX86Features ();
 
@@ -9434,7 +9479,7 @@ static BOOL MountFavoriteVolumeBase (HWND hwnd, const FavoriteVolume &favorite, 
 
 	if (favorite.UseVolumeID && !IsRepeatedByteArray (0, favorite.VolumeID, sizeof (favorite.VolumeID)))
 	{
-		effectiveVolumePath = FindDeviceByVolumeID (favorite.VolumeID);
+		effectiveVolumePath = FindDeviceByVolumeID (favorite.VolumeID, (ServiceMode && systemFavorites)? TRUE : FALSE);
 	}
 	else
 		effectiveVolumePath = favorite.Path;
@@ -9600,7 +9645,7 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 				{
 					if (favorite->UseVolumeID)
 					{
-						std::wstring path = FindDeviceByVolumeID (favorite->VolumeID);
+						std::wstring path = FindDeviceByVolumeID (favorite->VolumeID, TRUE);
 						if (path.empty ())
 						{
 							favorite->DisconnectedDevice = true;
@@ -9660,6 +9705,9 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 		{
 			Sleep (5000);
 
+			SystemFavoritesServiceLogInfo (wstring (L"Updating list of host devices"));
+			UpdateMountableHostDeviceList ();
+
 			SystemFavoritesServiceLogInfo (wstring (L"Trying to mount skipped system favorites"));
 
 			// Update the service status to avoid being killed
@@ -9675,7 +9723,7 @@ BOOL MountFavoriteVolumes (HWND hwnd, BOOL systemFavorites, BOOL logOnMount, BOO
 					wstring resolvedPath;
 					if (favorite->UseVolumeID)
 					{
-						resolvedPath = FindDeviceByVolumeID (favorite->VolumeID);
+						resolvedPath = FindDeviceByVolumeID (favorite->VolumeID, TRUE);
 					}
 					else
 						resolvedPath = VolumeGuidPathToDevicePath (favorite->Path);
@@ -10400,15 +10448,15 @@ int RestoreVolumeHeader (HWND hwndDlg, const wchar_t *lpszVolume)
 			}
 			else
 			{
-				DISK_GEOMETRY_EX driveInfo;
+				BYTE dgBuffer[256];
 
 				bResult = DeviceIoControl (dev, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0,
-					&driveInfo, sizeof (driveInfo), &dwResult, NULL);
+					dgBuffer, sizeof (dgBuffer), &dwResult, NULL);
 
 				if (!bResult)
 					goto error;
 
-				hostSize = driveInfo.DiskSize.QuadPart;
+				hostSize = ((PDISK_GEOMETRY_EX) dgBuffer)->DiskSize.QuadPart;
 			}
 
 			if (hostSize == 0)
@@ -10639,6 +10687,7 @@ static BOOL CALLBACK PerformanceSettingsDlgProc (HWND hwndDlg, UINT msg, WPARAM 
 			uint32 driverConfig = ReadDriverConfigurationFlags();
 			CheckDlgButton (hwndDlg, IDC_ENABLE_HARDWARE_ENCRYPTION, (driverConfig & TC_DRIVER_CONFIG_DISABLE_HARDWARE_ENCRYPTION) ? BST_UNCHECKED : BST_CHECKED);
 			CheckDlgButton (hwndDlg, IDC_ENABLE_EXTENDED_IOCTL_SUPPORT, (driverConfig & TC_DRIVER_CONFIG_ENABLE_EXTENDED_IOCTL) ? BST_CHECKED : BST_UNCHECKED);
+			CheckDlgButton (hwndDlg, IDC_ALLOW_TRIM_NONSYS_SSD, (driverConfig & VC_DRIVER_CONFIG_ALLOW_NONSYS_TRIM) ? BST_CHECKED : BST_UNCHECKED);
 
 			SYSTEM_INFO sysInfo;
 			GetSystemInfo (&sysInfo);
@@ -10696,6 +10745,7 @@ static BOOL CALLBACK PerformanceSettingsDlgProc (HWND hwndDlg, UINT msg, WPARAM 
 
 				BOOL disableHW = !IsDlgButtonChecked (hwndDlg, IDC_ENABLE_HARDWARE_ENCRYPTION);
 				BOOL enableExtendedIOCTL = IsDlgButtonChecked (hwndDlg, IDC_ENABLE_EXTENDED_IOCTL_SUPPORT);
+				BOOL allowTrimCommand = IsDlgButtonChecked (hwndDlg, IDC_ALLOW_TRIM_NONSYS_SSD);
 
 				try
 				{
@@ -10732,6 +10782,7 @@ static BOOL CALLBACK PerformanceSettingsDlgProc (HWND hwndDlg, UINT msg, WPARAM 
 
 					SetDriverConfigurationFlag (TC_DRIVER_CONFIG_DISABLE_HARDWARE_ENCRYPTION, disableHW);
 					SetDriverConfigurationFlag (TC_DRIVER_CONFIG_ENABLE_EXTENDED_IOCTL, enableExtendedIOCTL);
+					SetDriverConfigurationFlag (VC_DRIVER_CONFIG_ALLOW_NONSYS_TRIM, allowTrimCommand);
 
 					DWORD bytesReturned;
 					if (!DeviceIoControl (hDriver, TC_IOCTL_REREAD_DRIVER_CONFIG, NULL, 0, NULL, 0, &bytesReturned, NULL))
@@ -11058,6 +11109,7 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 				uint16 bootLoaderVersion = 0;
 				BOOL bPasswordCacheEnabled = (driverConfig & TC_DRIVER_CONFIG_CACHE_BOOT_PASSWORD)? TRUE : FALSE;
 				BOOL bPimCacheEnabled = (driverConfig & TC_DRIVER_CONFIG_CACHE_BOOT_PIM)? TRUE : FALSE;
+				BOOL bBlockSysEncTrimEnabled = (driverConfig & VC_DRIVER_CONFIG_BLOCK_SYS_TRIM)? TRUE : FALSE;
 
 				if (!BootEncObj->ReadBootSectorConfig (nullptr, 0, &userConfig, &customUserMessage, &bootLoaderVersion))
 				{
@@ -11099,6 +11151,7 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 				CheckDlgButton (hwndDlg, IDC_BOOT_LOADER_CACHE_PASSWORD, bPasswordCacheEnabled ? BST_CHECKED : BST_UNCHECKED);
 				EnableWindow (GetDlgItem (hwndDlg, IDC_BOOT_LOADER_CACHE_PIM), bPasswordCacheEnabled);
 				CheckDlgButton (hwndDlg, IDC_BOOT_LOADER_CACHE_PIM, (bPasswordCacheEnabled && bPimCacheEnabled)? BST_CHECKED : BST_UNCHECKED);
+				CheckDlgButton (hwndDlg, IDC_BLOCK_SYSENC_TRIM, bBlockSysEncTrimEnabled ? BST_CHECKED : BST_UNCHECKED);
 			}
 			catch (Exception &e)
 			{
@@ -11210,10 +11263,12 @@ static BOOL CALLBACK BootLoaderPreferencesDlgProc (HWND hwndDlg, UINT msg, WPARA
 				{
 					BOOL bPasswordCacheEnabled = IsDlgButtonChecked (hwndDlg, IDC_BOOT_LOADER_CACHE_PASSWORD);
 					BOOL bPimCacheEnabled = IsDlgButtonChecked (hwndDlg, IDC_BOOT_LOADER_CACHE_PIM);
+					BOOL bBlockSysEncTrimEnabled = IsDlgButtonChecked (hwndDlg, IDC_BLOCK_SYSENC_TRIM);
 					BootEncObj->WriteBootSectorUserConfig (userConfig, customUserMessage, prop.volumePim, prop.pkcs5);
 					SetDriverConfigurationFlag (TC_DRIVER_CONFIG_CACHE_BOOT_PASSWORD, bPasswordCacheEnabled);
 					SetDriverConfigurationFlag (TC_DRIVER_CONFIG_CACHE_BOOT_PIM, (bPasswordCacheEnabled && bPimCacheEnabled)? TRUE : FALSE);
 					SetDriverConfigurationFlag (TC_DRIVER_CONFIG_DISABLE_EVIL_MAID_ATTACK_DETECTION, IsDlgButtonChecked (hwndDlg, IDC_DISABLE_EVIL_MAID_ATTACK_DETECTION));
+					SetDriverConfigurationFlag (VC_DRIVER_CONFIG_BLOCK_SYS_TRIM, bBlockSysEncTrimEnabled);
 				}
 				catch (Exception &e)
 				{

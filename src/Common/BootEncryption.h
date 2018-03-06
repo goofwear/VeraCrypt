@@ -58,6 +58,7 @@ namespace VeraCrypt
 		bool IsDevice;
 		wstring Path;
 		DWORD LastError;
+		BYTE ReadBuffer[4096];
 	};
 
 

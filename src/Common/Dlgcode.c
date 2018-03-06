@@ -26,7 +26,7 @@
 #include <time.h>
 #include <tchar.h>
 #include <Richedit.h>
-#ifdef TCMOUNT
+#if defined (TCMOUNT) || defined (VOLFORMAT)
 #include <Shlwapi.h>
 #include <process.h>
 #include <Tlhelp32.h>
@@ -389,6 +389,19 @@ typedef struct
 
 } MULTI_CHOICE_DLGPROC_PARAMS;
 
+void InitGlobalLocks ()
+{
+	InitializeCriticalSection (&csWNetCalls);
+	InitializeCriticalSection (&csMountableDevices);
+	InitializeCriticalSection (&csVolumeIdCandidates);
+}
+
+void FinalizeGlobalLocks ()
+{
+	DeleteCriticalSection (&csWNetCalls);
+	DeleteCriticalSection (&csMountableDevices);
+	DeleteCriticalSection (&csVolumeIdCandidates);
+}
 
 void cleanup ()
 {
@@ -468,9 +481,7 @@ void cleanup ()
 	EncryptionThreadPoolStop();
 #endif
 
-	DeleteCriticalSection (&csWNetCalls);
-	DeleteCriticalSection (&csMountableDevices);
-	DeleteCriticalSection (&csVolumeIdCandidates);
+	FinalizeGlobalLocks ();
 }
 
 
@@ -2523,6 +2534,7 @@ void SavePostInstallTasksSettings (int command)
 	case TC_POST_INSTALL_CFG_REMOVE_ALL:
 		_wremove (GetConfigPath (TC_APPD_FILENAME_POST_INSTALL_TASK_TUTORIAL));
 		_wremove (GetConfigPath (TC_APPD_FILENAME_POST_INSTALL_TASK_RELEASE_NOTES));
+		_wremove (GetConfigPath (TC_APPD_FILENAME_POST_INSTALL_TASK_RESCUE_DISK));
 		break;
 
 	case TC_POST_INSTALL_CFG_TUTORIAL:
@@ -2531,6 +2543,10 @@ void SavePostInstallTasksSettings (int command)
 
 	case TC_POST_INSTALL_CFG_RELEASE_NOTES:
 		f = _wfopen (GetConfigPath (TC_APPD_FILENAME_POST_INSTALL_TASK_RELEASE_NOTES), L"w");
+		break;
+
+	case TC_POST_INSTALL_CFG_RESCUE_DISK:
+		f = _wfopen (GetConfigPath (TC_APPD_FILENAME_POST_INSTALL_TASK_RESCUE_DISK), L"w");
 		break;
 
 	default:
@@ -2569,6 +2585,14 @@ void DoPostInstallTasks (HWND hwndDlg)
 	{
 		if (AskYesNo ("AFTER_UPGRADE_RELEASE_NOTES", hwndDlg) == IDYES)
 			Applink ("releasenotes");
+
+		bDone = TRUE;
+	}
+
+	if (FileExists (GetConfigPath (TC_APPD_FILENAME_POST_INSTALL_TASK_RESCUE_DISK)))
+	{
+		if (AskYesNo ("AFTER_UPGRADE_RESCUE_DISK", hwndDlg) == IDYES)
+			PostMessage (hwndDlg, VC_APPMSG_CREATE_RESCUE_DISK, 0, 0);
 
 		bDone = TRUE;
 	}
@@ -2694,9 +2718,7 @@ void InitApp (HINSTANCE hInstance, wchar_t *lpszCommandLine)
 
 	VirtualLock (&CmdTokenPin, sizeof (CmdTokenPin));
 
-	InitializeCriticalSection (&csWNetCalls);
-	InitializeCriticalSection (&csMountableDevices);
-	InitializeCriticalSection (&csVolumeIdCandidates);
+	InitGlobalLocks ();
 
 	LoadSystemDll (L"ntmarta.dll", &hntmartadll, TRUE, SRC_POS);
 	LoadSystemDll (L"MPR.DLL", &hmprdll, TRUE, SRC_POS);
@@ -4952,9 +4974,6 @@ wstring GetUserFriendlyVersionString (int version)
 
 	versionString.insert (version > 0xfff ? 2 : 1,L".");
 
-	if (versionString[versionString.length()-1] == L'0')
-		versionString.erase (versionString.length()-1, 1); 
-
 	return (versionString);
 }
 
@@ -5801,7 +5820,7 @@ BOOL CALLBACK BenchmarkDlgProc (HWND hwndDlg, UINT msg, WPARAM wParam, LPARAM lP
 
 			if (benchmarkType == BENCHMARK_TYPE_PRF)
 			{
-				benchmarkPim = GetPim (hwndDlg, IDC_PIM);
+				benchmarkPim = GetPim (hwndDlg, IDC_PIM, 0);
 				benchmarkPreBoot = GetCheckBox (hwndDlg, IDC_BENCHMARK_PREBOOT);
 			}
 			else
@@ -7640,7 +7659,7 @@ static BOOL PerformMountIoctl (MOUNT_STRUCT* pmount, LPDWORD pdwResult, BOOL use
 {
 	if (useVolumeID)
 	{
-		wstring devicePath = FindDeviceByVolumeID (volumeID);
+		wstring devicePath = FindDeviceByVolumeID (volumeID, FALSE);
 		if (devicePath == L"")
 		{
 			if (pdwResult)
@@ -8486,11 +8505,14 @@ BOOL GetPhysicalDriveGeometry (int driveNumber, PDISK_GEOMETRY_EX diskGeometry)
 		DWORD bytesRead = 0;
 
 		ZeroMemory (diskGeometry, sizeof (DISK_GEOMETRY_EX));
+		BYTE dgBuffer[256];
 
-		if (	DeviceIoControl (hDev, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, diskGeometry, sizeof (DISK_GEOMETRY_EX), &bytesRead, NULL)
-			&& (bytesRead == sizeof (DISK_GEOMETRY_EX))
-			&& diskGeometry->Geometry.BytesPerSector)
+		if (	DeviceIoControl (hDev, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, dgBuffer, sizeof (dgBuffer), &bytesRead, NULL)
+			&& (bytesRead >= (sizeof (DISK_GEOMETRY) + sizeof (LARGE_INTEGER)))
+			&& ((PDISK_GEOMETRY_EX) dgBuffer)->Geometry.BytesPerSector)
 		{
+			memcpy (&diskGeometry->Geometry, &((PDISK_GEOMETRY_EX) dgBuffer)->Geometry, sizeof (DISK_GEOMETRY));
+			diskGeometry->DiskSize.QuadPart = ((PDISK_GEOMETRY_EX) dgBuffer)->DiskSize.QuadPart;
 			bResult = TRUE;
 		}
 
@@ -10891,15 +10913,15 @@ int OpenVolume (OpenVolumeContext *context, const wchar_t *volumePath, Password 
 		}
 		else
 		{
-			DISK_GEOMETRY_EX driveInfo;
+			BYTE dgBuffer[256];
 
-			if (!DeviceIoControl (context->HostFileHandle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, &driveInfo, sizeof (driveInfo), &dwResult, NULL))
+			if (!DeviceIoControl (context->HostFileHandle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, dgBuffer, sizeof (dgBuffer), &dwResult, NULL))
 			{
 				status = ERR_OS_ERROR;
 				goto error;
 			}
 
-			context->HostSize = driveInfo.DiskSize.QuadPart;
+			context->HostSize = ((PDISK_GEOMETRY_EX) dgBuffer)->DiskSize.QuadPart;
 		}
 
 		if (context->HostSize == 0)
@@ -11087,10 +11109,10 @@ BOOL IsPagingFileActive (BOOL checkNonWindowsPartitionsOnly)
 		if (handle == INVALID_HANDLE_VALUE)
 			continue;
 
-		DISK_GEOMETRY_EX driveInfo;
+		BYTE dgBuffer[256];
 		DWORD dwResult;
 
-		if (!DeviceIoControl (handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, &driveInfo, sizeof (driveInfo), &dwResult, NULL))
+		if (!DeviceIoControl (handle, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, dgBuffer, sizeof (dgBuffer), &dwResult, NULL))
 		{
 			CloseHandle (handle);
 			continue;
@@ -11646,7 +11668,7 @@ BOOL InitSecurityTokenLibrary (HWND hwndDlg)
 				HWND hParent = IsWindow (m_hwnd)? m_hwnd : GetActiveWindow();
 				if (!hParent)
 					hParent = GetForegroundWindow ();
-				if (DialogBoxParamW (hInst, MAKEINTRESOURCEW (IDD_TOKEN_PASSWORD), hParent, (DLGPROC) SecurityTokenPasswordDlgProc, (LPARAM) &str) == IDCANCEL)
+				if (SecureDesktopDialogBoxParam (hInst, MAKEINTRESOURCEW (IDD_TOKEN_PASSWORD), hParent, (DLGPROC) SecurityTokenPasswordDlgProc, (LPARAM) &str) == IDCANCEL)
 					throw UserAbort (SRC_POS);
 			}
 			if (hCursor != NULL)
@@ -12100,10 +12122,11 @@ void UpdateMountableHostDeviceList ()
 							OPEN_EXISTING,
 							0,
 							NULL );
-						if (handle != INVALID_HANDLE_VALUE)
+						if ((handle != INVALID_HANDLE_VALUE) || (GetLastError () == ERROR_ACCESS_DENIED))
 						{
 							AddDeviceToList (mountableDevices, It->SystemNumber, layout->PartitionEntry[i].PartitionNumber);
-							CloseHandle (handle);
+							if (handle != INVALID_HANDLE_VALUE)
+								CloseHandle (handle);
 						}
 					}
 				}
@@ -12148,10 +12171,8 @@ void UpdateMountableHostDeviceList ()
 	}
 }
 
-wstring FindDeviceByVolumeID (const BYTE volumeID [VOLUME_ID_SIZE])
+wstring FindDeviceByVolumeID (const BYTE volumeID [VOLUME_ID_SIZE], BOOL bFromService)
 {
-	static std::vector<HostDevice>  volumeIdCandidates;
-
 	/* if it is already mounted, get the real path name used for mounting */
 	MOUNT_LIST_STRUCT mlist;
 	DWORD dwResult;
@@ -12182,77 +12203,108 @@ wstring FindDeviceByVolumeID (const BYTE volumeID [VOLUME_ID_SIZE])
 
 	/* not mounted. Look for it in the local drives*/
 
-	EnterCriticalSection (&csMountableDevices);
-	std::vector<HostDevice> newDevices = mountableDevices;
-	LeaveCriticalSection (&csMountableDevices);
-
-	EnterCriticalSection (&csVolumeIdCandidates);
-	finally_do ({ LeaveCriticalSection (&csVolumeIdCandidates); });
-
-	/* remove any devices that don't exist anymore */
-	for (std::vector<HostDevice>::iterator It = volumeIdCandidates.begin();
-		It != volumeIdCandidates.end();)
+	if (bFromService)
 	{
-		bool bFound = false;
+		for (int devNumber = 0; devNumber < MAX_HOST_DRIVE_NUMBER; devNumber++)
+		{
+			for (int partNumber = 0; partNumber < MAX_HOST_PARTITION_NUMBER; partNumber++)
+			{
+				wstringstream strm;
+				strm << L"\\Device\\Harddisk" << devNumber << L"\\Partition" << partNumber;
+				wstring devPathStr (strm.str());
+				const wchar_t *devPath = devPathStr.c_str();
+
+				OPEN_TEST_STRUCT openTest = {0};
+				if (OpenDevice (devPath, &openTest, TRUE, TRUE)
+					&& (openTest.VolumeIDComputed[TC_VOLUME_TYPE_NORMAL] && openTest.VolumeIDComputed[TC_VOLUME_TYPE_HIDDEN])
+					)
+				{
+					if (	(0 == memcmp (volumeID, openTest.volumeIDs[TC_VOLUME_TYPE_NORMAL], VOLUME_ID_SIZE))
+								||	(0 == memcmp (volumeID, openTest.volumeIDs[TC_VOLUME_TYPE_HIDDEN], VOLUME_ID_SIZE))
+						)
+					{
+						return devPath;
+					}
+				}					
+			}
+		}
+	}
+	else
+	{
+		static std::vector<HostDevice>  volumeIdCandidates;
+
+		EnterCriticalSection (&csMountableDevices);
+		std::vector<HostDevice> newDevices = mountableDevices;
+		LeaveCriticalSection (&csMountableDevices);
+
+		EnterCriticalSection (&csVolumeIdCandidates);
+		finally_do ({ LeaveCriticalSection (&csVolumeIdCandidates); });
+
+		/* remove any devices that don't exist anymore */
+		for (std::vector<HostDevice>::iterator It = volumeIdCandidates.begin();
+			It != volumeIdCandidates.end();)
+		{
+			bool bFound = false;
+			for (std::vector<HostDevice>::iterator newIt = newDevices.begin();
+				newIt != newDevices.end(); newIt++)
+			{
+				if (It->Path == newIt->Path)
+				{
+					bFound = true;
+					break;
+				}
+			}
+
+			if (bFound)
+				It++;
+			else
+				It = volumeIdCandidates.erase (It);
+		}
+
+		/* Add newly inserted devices and compute their VolumeID */
 		for (std::vector<HostDevice>::iterator newIt = newDevices.begin();
 			newIt != newDevices.end(); newIt++)
 		{
-			if (It->Path == newIt->Path)
+			bool bFound = false;
+
+			for (std::vector<HostDevice>::iterator It = volumeIdCandidates.begin();
+				It != volumeIdCandidates.end(); It++)
 			{
-				bFound = true;
-				break;
+				if (It->Path == newIt->Path)
+				{
+					bFound = true;
+					break;
+				}
+			}
+
+			if (!bFound)
+			{
+				/* new device/partition. Compute its Volume IDs */
+				OPEN_TEST_STRUCT openTest = {0};
+				if (OpenDevice (newIt->Path.c_str(), &openTest, TRUE, TRUE)
+					&& (openTest.VolumeIDComputed[TC_VOLUME_TYPE_NORMAL] && openTest.VolumeIDComputed[TC_VOLUME_TYPE_HIDDEN])
+					)
+				{
+					memcpy (newIt->VolumeIDs, openTest.volumeIDs, sizeof (newIt->VolumeIDs));
+					newIt->HasVolumeIDs = true;
+				}
+				else
+					newIt->HasVolumeIDs = false;
+				volumeIdCandidates.push_back (*newIt);
 			}
 		}
-
-		if (bFound)
-			It++;
-		else
-			It = volumeIdCandidates.erase (It);
-	}
-
-	/* Add newly inserted devices and compute their VolumeID */
-	for (std::vector<HostDevice>::iterator newIt = newDevices.begin();
-		newIt != newDevices.end(); newIt++)
-	{
-		bool bFound = false;
 
 		for (std::vector<HostDevice>::iterator It = volumeIdCandidates.begin();
 			It != volumeIdCandidates.end(); It++)
 		{
-			if (It->Path == newIt->Path)
-			{
-				bFound = true;
-				break;
-			}
-		}
-
-		if (!bFound)
-		{
-			/* new device/partition. Compute its Volume IDs */
-			OPEN_TEST_STRUCT openTest = {0};
-			if (OpenDevice (newIt->Path.c_str(), &openTest, TRUE, TRUE)
-				&& (openTest.VolumeIDComputed[TC_VOLUME_TYPE_NORMAL] && openTest.VolumeIDComputed[TC_VOLUME_TYPE_HIDDEN])
+			if (	It->HasVolumeIDs &&
+					(	(0 == memcmp (volumeID, It->VolumeIDs[TC_VOLUME_TYPE_NORMAL], VOLUME_ID_SIZE))
+						||	(0 == memcmp (volumeID, It->VolumeIDs[TC_VOLUME_TYPE_HIDDEN], VOLUME_ID_SIZE))
+					)
 				)
 			{
-				memcpy (newIt->VolumeIDs, openTest.volumeIDs, sizeof (newIt->VolumeIDs));
-				newIt->HasVolumeIDs = true;
+				return It->Path;
 			}
-			else
-				newIt->HasVolumeIDs = false;
-			volumeIdCandidates.push_back (*newIt);
-		}
-	}
-
-	for (std::vector<HostDevice>::iterator It = volumeIdCandidates.begin();
-		It != volumeIdCandidates.end(); It++)
-	{
-		if (	It->HasVolumeIDs &&
-				(	(0 == memcmp (volumeID, It->VolumeIDs[TC_VOLUME_TYPE_NORMAL], VOLUME_ID_SIZE))
-					||	(0 == memcmp (volumeID, It->VolumeIDs[TC_VOLUME_TYPE_HIDDEN], VOLUME_ID_SIZE))
-				)
-			)
-		{
-			return It->Path;
 		}
 	}
 
@@ -12670,9 +12722,9 @@ std::wstring FindLatestFileOrDirectory (const std::wstring &directory, const wch
 	return wstring (directory) + L"\\" + name;
 }
 
-int GetPim (HWND hwndDlg, UINT ctrlId)
+int GetPim (HWND hwndDlg, UINT ctrlId, int defaultPim)
 {
-	int pim = 0;
+	int pim = defaultPim;
 	HWND hCtrl = GetDlgItem (hwndDlg, ctrlId);
 	if (IsWindowEnabled (hCtrl) && IsWindowVisible (hCtrl))
 	{
@@ -12682,7 +12734,7 @@ int GetPim (HWND hwndDlg, UINT ctrlId)
 			wchar_t* endPtr = NULL;
 			pim = wcstol(szTmp, &endPtr, 10);
 			if (pim < 0 || endPtr == szTmp || !endPtr || *endPtr != L'\0')
-				pim = 0;
+				pim = defaultPim;
 		}
 	}
 	return pim;
@@ -12882,7 +12934,7 @@ BOOL TranslateVolumeID (HWND hwndDlg, wchar_t* pathValue, size_t cchPathValue)
 			&& (arr.size() == VOLUME_ID_SIZE)
 			)
 		{
-			std::wstring devicePath = FindDeviceByVolumeID (&arr[0]);
+			std::wstring devicePath = FindDeviceByVolumeID (&arr[0], FALSE);
 			if (devicePath.length() > 0)
 				StringCchCopyW (pathValue, cchPathValue, devicePath.c_str());
 			else
@@ -13004,7 +13056,7 @@ BOOL DeleteDirectory (const wchar_t* szDirName)
 	return bStatus;
 }
 
-#ifdef TCMOUNT
+#if defined (TCMOUNT) || defined (VOLFORMAT)
 /*********************************************************************/
 
 static BOOL GenerateRandomString (HWND hwndDlg, LPTSTR szName, DWORD maxCharsCount)

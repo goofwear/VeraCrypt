@@ -139,6 +139,9 @@ ifneq (,$(filter i386 i486 i586 i686 x86,$(ARCH)))
 else ifneq (,$(filter x86_64 x86-64 amd64 x64,$(ARCH)))
 	CPU_ARCH = x64
     ASFLAGS += -f elf64 -D __BITS__=64
+else ifneq (,$(filter armv7l,$(ARCH)))
+	PLATFORM_ARCH := armv7
+	CPU_ARCH = armv7
 endif
 
 ifeq "$(origin NOASM)" "command line"
@@ -167,8 +170,8 @@ ifeq "$(shell uname -s)" "Linux"
 		CFLAGS += -msse2
 		CXXFLAGS += -msse2
 
-		GCC_GTEQ_440 := $(shell expr `gcc -dumpversion | sed -e 's/\.\([0-9][0-9]\)/\1/g' -e 's/\.\([0-9]\)/0\1/g' -e 's/^[0-9]\{3,4\}$$/&00/'` \>= 40400)
-		GCC_GTEQ_430 := $(shell expr `gcc -dumpversion | sed -e 's/\.\([0-9][0-9]\)/\1/g' -e 's/\.\([0-9]\)/0\1/g' -e 's/^[0-9]\{3,4\}$$/&00/'` \>= 40300)
+		GCC_GTEQ_440 := $(shell expr `gcc -dumpversion | sed -e 's/\.\([0-9][0-9]\)/\1/g' -e 's/\.\([0-9]\)/0\1/g' -e 's/^[0-9]\{3,4\}$$/&00/' -e 's/^[0-9]\{1,2\}$$/&0000/'` \>= 40400)
+		GCC_GTEQ_430 := $(shell expr `gcc -dumpversion | sed -e 's/\.\([0-9][0-9]\)/\1/g' -e 's/\.\([0-9]\)/0\1/g' -e 's/^[0-9]\{3,4\}$$/&00/' -e 's/^[0-9]\{1,2\}$$/&0000/'` \>= 40300)
 		ifeq "$(GCC_GTEQ_440)" "1"
 			CFLAGS += -maes
 			CXXFLAGS += -maes
@@ -287,6 +290,18 @@ ifeq "$(shell uname -s)" "FreeBSD"
 	
 	CC := cc
 	CXX := c++
+	
+	ifeq "$(TC_BUILD_CONFIG)" "Release"
+		C_CXX_FLAGS += -fdata-sections -ffunction-sections -fpie
+		LFLAGS += -Wl,--gc-sections -pie
+
+		ifneq "$(shell ld --help 2>&1 | grep sysv | wc -l)" "0"
+			LFLAGS += -Wl,--hash-style=sysv
+		endif
+
+		WXCONFIG_CFLAGS += -fpie -fPIC
+		WXCONFIG_CXXFLAGS += -fpie -fPIC
+	endif
 
 	ifeq "$(SIMD_SUPPORTED)" "1"
 		CFLAGS += -msse2 -maes
